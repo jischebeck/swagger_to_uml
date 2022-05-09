@@ -31,7 +31,7 @@ class Property:
     def __init__(self, name, type, required, example=None, description=None, default=None, enum=None, format=None,
                  items=None, maximum=None, exclusive_maximum=False, minimum=None, exclusive_minimum=False,
                  multiple_of=None, max_length=None, min_length=0, pattern=None, max_items=None, min_items=0,
-                 unique_items=False, ref_type=None):
+                 unique_items=False, ref_type=None, sub_objects=[]):
         # type
         self.type = type  # type: str
         self.format = format  # type: Optional[str]
@@ -64,9 +64,13 @@ class Property:
         self.min_items = min_items  # type: int
         self.unique_items = unique_items  # type: bool
         self.items = items  # type: Optional[str]
+        
+        # inline object definitions
+        self.sub_objects = sub_objects # type: Optional[List]
 
     @staticmethod
     def from_dict(property_name, d, required):
+                
         # whether the type was resolved
         ref_type = None
 
@@ -92,7 +96,20 @@ class Property:
 
         # join multiple types to string
         if isinstance(type_str, list):
-            type_str = '/'.join(type_str)
+            type_str = '/'.join(type_str)            
+
+        sub_objects = []
+        if type_str=="object":
+            global obj_cnt
+            try:
+                obj_cnt = obj_cnt+1
+            except:
+                obj_cnt = 1
+                
+            type_str ='UnknownObject%s'%obj_cnt
+            sub_objects.append(Definition.from_dict(type_str,d))
+            ref_type = type_str
+            
 
         # items type is given or must be resolved from $ref
         if 'items' in type_dict:
@@ -125,7 +142,8 @@ class Property:
             max_items=d.get('maxItems', 0),
             min_items=d.get('minItems'),
             unique_items=d.get('uniqueItems', False),
-            ref_type=ref_type
+            ref_type=ref_type,
+            sub_objects = sub_objects 
         )
 
     @property
@@ -163,8 +181,9 @@ class Property:
         result = '{{field}} {type_str} {name_str}'.format(type_str=type_str, name_str=name_str)
 
         # enum
-        if self.enum is not None:
-            result += ' {{{enum_str}}}'.format(enum_str=', '.join([json.dumps(x) for x in self.enum]))
+        # TODO: make enum deactivation optional
+        #if self.enum is not None:
+        #    result += ' {{{enum_str}}}'.format(enum_str=', '.join([json.dumps(x) for x in self.enum]))
 
         # min/max
         if self.minimum or self.maximum:
@@ -241,27 +260,58 @@ class Parameter:
             required=d.get('required', False),
             property=Property.from_dict(d['name'], d, d.get('required', False))
         )
+    
+    @staticmethod
+    def from_requestbody_dict(d):
+        if d:
+            return [Parameter(
+                name='RequestBody',
+                location='RequestBody',
+                description=d.get('description'),
+                required=d.get('required', False),
+                property=Content.from_dict('', d['content'])
+                ) ]   
+        else:
+            return []
+    
+
+class Content:
+    def __init__(self, contenttype, property):
+        self.contenttype = contenttype  # type: str        
+        self.property = property  # type: Property
+
+    @staticmethod
+    def from_dict(whole, d):        
+        contenttype=list(d.keys())[0]
+        return Content(
+            contenttype = contenttype,
+            property=Property.from_dict('', d[contenttype]['schema'], False)
+        )
+    @property
+    def ref_type(self):
+        return self.property.ref_type
+
 
 
 class Response:
-    def __init__(self, status, description, property):
+    def __init__(self, status, description, content):
         self.status = status  # type: str
         self.description = description  # type: Optional[str]
-        self.property = property  # type: Property
+        self.content = content  # type: Property
 
     @staticmethod
     def from_dict(whole, status, d):
         return Response(
             status=status,
             description=d.get('description'),
-            property=Property.from_dict('', d, False)
+            content=Content.from_dict('', d.get("content",{"*/*":{'schema':{}}}))            
         )
 
     @property
     def uml(self):
         return '{status}: {type}'.format(
             status=self.status,
-            type=self.property.uml
+            type=self.content.property.uml
         )
 
 
@@ -287,7 +337,9 @@ class Operation:
             description=d.get('description'),
             tags=d.get('tags'),
             responses=[Response.from_dict(whole, status, response) for status, response in d['responses'].items()],
-            parameters=path_parameters + [Parameter.from_dict(whole, param) for param in d.get('parameters', [])]
+            parameters=path_parameters + Parameter.from_requestbody_dict(d.get('requestBody'))+
+                [Parameter.from_dict(whole, param) for param in d.get('parameters', [])] 
+                
         )
 
     @property
@@ -304,15 +356,22 @@ class Operation:
             for parameter in [x for x in self.parameters if x.location == parameter_type]:
                 parameter_strings.append('{parameter_uml}'.format(parameter_uml=parameter.property.uml))
 
-        # collect references from responses and parameters
-        references = [x.property.ref_type for x in self.responses if x.property.ref_type] + \
-                     [x.property.ref_type for x in self.parameters if x.property.ref_type]
+        sub_objects=[]
+        for r in self.responses:
+            for s in r.content.property.sub_objects:
+                sub_objects.append(s)
 
-        return """class "{name}" {{\n{parameter_str}\n.. responses ..\n{response_str}\n}}\n\n{associations}\n""".format(
+        # collect references from responses and parameters
+        fw_references = [x.content.property.ref_type for x in self.responses if x.content.property.ref_type]
+        bw_references = [x.property.ref_type for x in self.parameters if x.property.ref_type]
+                     
+        return """class "{name}" {{\n{parameter_str}\n.. responses ..\n{response_str}\n}}\n\n{sub_objects}\n{bw_associations}\n{fw_associations}\n""".format(
             name=self.name,
             response_str='\n'.join([x.uml for x in self.responses]),
             parameter_str='\n'.join(parameter_strings),
-            associations='\n'.join({'"{name}" ..> {type}'.format(name=self.name, type=type) for type in references})
+            fw_associations='\n'.join({'"{name}" ..> {type}'.format(name=self.name, type=type) for type in fw_references}),
+            bw_associations='\n'.join({'"{name}" <.. {type}'.format(name=self.name, type=type) for type in bw_references}),
+            sub_objects='\n'.join("{sub_object}".format(sub_object=s.uml) for s in sub_objects)
         )
 
     @property
@@ -347,35 +406,64 @@ class Path:
 
 
 class Swagger:
-    def __init__(self, definitions, paths):
+    def __init__(self, definitions, paths, namespace=''):
         self.definitions = definitions  # type: List[Definition]
         self.paths = paths  # type: List[Path]
+        self.namespace = namespace
+        global obj_cnt
+        try:
+            del obj_cnt
+        except:
+            pass
 
     @staticmethod
-    def from_dict(d):
-        definitions = [Definition.from_dict(name, definition) for name, definition in d.get('definitions',{}).items()]
+    def from_dict(d, namespace=''):
+        components = d.get("components",{})
+        definitions = [Definition.from_dict(name, definition) for name, definition in components.get('schemas',{}).items()]
         paths = [Path.from_dict(d, path_name, path) for path_name, path in d['paths'].items()]
-        return Swagger(definitions=definitions, paths=paths)
+        return Swagger(definitions=definitions, paths=paths, namespace=namespace)
 
     @staticmethod
-    def from_file(filename):
+    def from_file(filename, namespace=''):
         loader = json.load
         if filename.endswith('.yml') or filename.endswith('.yaml'):
             import yaml
-            loader = yaml.load
+            loader = yaml.full_load 
+        if namespace == '':
+            namespace = filename
         with open(filename, 'r') as fd:
-            return Swagger.from_dict(loader(fd))
+            return Swagger.from_dict(loader(fd), namespace)
 
     @property
     def uml(self):
-        uml_str = '@startuml\nhide empty members\nset namespaceSeparator none\n\n{paths}\n{definitions}\n@enduml\n'
+        uml_str = '@startuml\nhide empty members\nset namespaceSeparator none\n\npackage "{namespace}" {{ \n{paths}\n{definitions}\n}}\n@enduml\n'
         return uml_str.format(
             paths='\n\n'.join([d.uml for d in self.paths]),
-            definitions='\n\n'.join([d.uml for d in self.definitions])
+            definitions='\n\n'.join([d.uml for d in self.definitions]),
+            namespace=self.namespace
         )
+    
+    def write_to_file(self, filename):
+        with open(filename,'w') as s:
+          s.write(self.uml)
+         
+    @staticmethod
+    def convert(input_filename,namespace='', output_filename=''):
+        if output_filename=='':
+           output_filename = input_filename[0:input_filename.rfind('.')]+'.plantuml'
+        sw = Swagger.from_file(input_filename,namespace)
+        sw.write_to_file(output_filename)
 
 
 if __name__ == '__main__':
+    if len(sys.argv)<=1:
+        print('add filename')
+        sys.exit(0)
     input_file_name = sys.argv[1]
-    sw = Swagger.from_file(input_file_name)
+        
+    namespace =''
+    if len(sys.argv)>2:
+        namespace = sys.argv[2]
+    
+    sw = Swagger.from_file(input_file_name,namespace)
     print(sw.uml, end='', flush=True)
